@@ -143,7 +143,10 @@ export class MainTurnExecution {
     let turnConversationId = state.currentConversationId;
     this.deps.steering.finishTurn(turnConversationId);
 
-    const streamGeneration = this.deps.turns.beginResponse();
+    // A pending background placeholder may disappear while this response runs;
+    // retain the last native checkpoint, not an arbitrary transcript tail.
+    const historyBoundary = state.messages.slice().reverse().find(message => message.role === 'assistant' && message.assistantMessageId)?.id ?? null;
+    const streamGeneration = this.deps.turns.beginResponse(historyBoundary);
     streamController.beginResponse();
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true; // Reset auto-scroll based on setting
 

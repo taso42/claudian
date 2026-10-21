@@ -26,6 +26,7 @@ export class TurnCoordinator implements TurnActivity {
   #phase: TurnPhase | null = null;
   #cancelRequested = false;
   #streamGeneration = 0;
+  #responseHistoryBoundary: string | null | undefined;
   readonly #listeners = new Set<() => void>();
 
   constructor(private readonly canAdmit: () => boolean = () => true) {}
@@ -61,6 +62,11 @@ export class TurnCoordinator implements TurnActivity {
     return this.#streamGeneration;
   }
 
+  /** Last checkpoint-bearing message before the response; null means none was available. */
+  get responseHistoryBoundary(): string | null | undefined {
+    return this.#responseHistoryBoundary;
+  }
+
   subscribe(listener: () => void): () => void {
     this.#listeners.add(listener);
     return () => {
@@ -83,8 +89,9 @@ export class TurnCoordinator implements TurnActivity {
   }
 
   /** Starts the provider-facing response and returns the generation that owns its presentation. */
-  beginResponse(): number {
+  beginResponse(historyBoundary?: string | null): number {
     if (this.#kind !== 'response') throw new Error('No admitted response can begin');
+    this.#responseHistoryBoundary = historyBoundary;
     this.#streamGeneration += 1;
     this.#setPhase('responding');
     return this.#streamGeneration;
@@ -113,6 +120,7 @@ export class TurnCoordinator implements TurnActivity {
         await execution;
       }
     } finally {
+      this.#responseHistoryBoundary = undefined;
       this.#controller = null;
       this.#activeTurn = null;
       this.#kind = null;

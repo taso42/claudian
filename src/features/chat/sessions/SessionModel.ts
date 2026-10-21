@@ -386,6 +386,7 @@ export function createSessionSideChat(session: ChatSessionRuntime, plugin: ChatF
           get providerId() { return session.providerId; },
           get draftModel() { return session.draftModel; },
           state: model.state, executionCoordinator: session.executionCoordinator,
+          get responseHistoryBoundary() { return session.turns.responseHistoryBoundary; },
         }, plugin, () => !session.isDisposed);
         if (session.isDisposed) return { ok: false, reason: 'stale-binding' };
         // The attached transcript is the source the user chose; only an evicted parent needs reloading.

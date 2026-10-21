@@ -208,6 +208,102 @@ it('hydrates an evicted model for a late native notification without replacing t
 });
 
 
+it.each(['running', 'finishes during capture', 'background placeholder removed'] as const)('forks the completed reply while main %s', async scenario => {
+  const h = setup();
+  const tab = await h.attach();
+  tab.controllers.drafts.restore('main', { content: 'Remember A' });
+  const first = tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(h.backend.sessions[0]?.requests).toHaveLength(1));
+  const main = h.backend.latest;
+  main.establishChild('main-native');
+  main.emitText('Remembered A');
+  main.complete('completed-checkpoint');
+  await first;
+  const completedHistory = structuredClone(tab.state.messages);
+  if (scenario === 'background placeholder removed') {
+    main.emitBackgroundEvent({ type: 'background_turn_started' });
+  }
+  await waitFor(() => expect(tab.state.messages).toHaveLength(completedHistory.length + (scenario === 'background placeholder removed' ? 1 : 0)));
+
+  tab.controllers.drafts.restore('main', { content: 'Long running task' });
+  const running = tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(main.requests).toHaveLength(2));
+  main.emitOutput({ type: 'assistant_message_started', nativeAssistantId: 'unfinished-checkpoint' });
+  main.emitText('Still working');
+  await waitFor(() => expect(tab.state.messages.at(-1)?.assistantMessageId).toBe('unfinished-checkpoint'));
+
+  if (scenario === 'background placeholder removed') {
+    main.emitBackgroundEvent({ type: 'background_turn_completed', reason: 'completed' });
+  }
+  await waitFor(() => expect(tab.state.messages).toHaveLength(completedHistory.length + 2));
+
+  const resolving = deferred<void>();
+  const resolve = tab.executionCoordinator.resolveForkSource.bind(tab.executionCoordinator);
+  const capture = jest.spyOn(tab.executionCoordinator, 'resolveForkSource').mockImplementation(async (...args) => {
+    const source = await resolve(...args);
+    await resolving.promise;
+    return source;
+  });
+  tab.controllers.drafts.restore('main', { content: '/side Explain A' });
+  const starting = tab.controllers.inputController.sendMessage();
+  try {
+    await waitFor(() => expect(capture).toHaveBeenCalled());
+    if (scenario === 'finishes during capture') {
+      main.complete('new-completed-checkpoint');
+      await running;
+    }
+  } finally { resolving.resolve(); }
+  await waitFor(() => expect(h.backend.sessions[1]?.requests).toHaveLength(1));
+  const child = h.backend.latest;
+  expect(child.config.resumeSeed?.providerState).toEqual({ forkSource: { sessionId: 'main-native', resumeAt: 'completed-checkpoint' } });
+  expect(child.requests[0].conversationHistory).toEqual(completedHistory);
+  expect(main.cancelCalls).toBe(0);
+  expect(main.disposeCalls).toBe(0);
+  expect(tab.state.isStreaming).toBe(scenario !== 'finishes during capture');
+  tab.controllers.sideChatController.cancelSide();
+  await starting;
+  expect(main.cancelCalls).toBe(0);
+  if (scenario !== 'finishes during capture') {
+    main.emitText(' Done');
+    main.complete('new-completed-checkpoint');
+    await running;
+  }
+  expect(tab.state.messages.at(-1)?.content).toBe(scenario === 'finishes during capture' ? 'Still working' : 'Still working Done');
+  await destroyTab(tab);
+});
+
+it.each(['first reply', 'full-session provider', 'missing boundary'] as const)(
+  'refuses an active-turn side fork with %s without interrupting main', async reason => {
+    const h = setup();
+    if (reason === 'full-session provider') {
+      const capabilities = ProviderRegistry.getCapabilities('claude');
+      jest.spyOn(ProviderRegistry, 'getCapabilities').mockReturnValue({ ...capabilities, forkMode: 'full-session' });
+    }
+    const tab = await h.attach();
+    if (reason !== 'first reply') {
+      tab.state.messages = [
+        { id: 'prior-user', role: 'user', content: 'Prior question', timestamp: testDate().getTime() },
+        { id: 'prior-answer', role: 'assistant', content: 'Prior answer', assistantMessageId: 'prior-checkpoint', timestamp: testDate().getTime() },
+      ];
+    }
+    tab.controllers.drafts.restore('main', { content: 'Long running task' });
+    const running = tab.controllers.inputController.sendMessage();
+    await waitFor(() => expect(h.backend.sessions[0]?.requests).toHaveLength(1));
+    const main = h.backend.latest;
+    main.emitOutput({ type: 'assistant_message_started', nativeAssistantId: 'unfinished-checkpoint' });
+    await waitFor(() => expect(tab.state.messages.at(-1)?.assistantMessageId).toBe('unfinished-checkpoint'));
+    if (reason === 'missing boundary') tab.state.messages = tab.state.messages.filter(message => message.id !== 'prior-answer');
+    await expect(tab.controllers.sideChatController.handleCommandSubmission('Explain', [])).resolves.toBe(false);
+    expect(tab.controllers.sideChatController.runtime).toBeNull();
+    expect(h.backend.sessions).toHaveLength(1);
+    expect(main.cancelCalls).toBe(0);
+    expect(tab.state.isStreaming).toBe(true);
+    main.complete();
+    await running;
+    await destroyTab(tab);
+  },
+);
+
 it('keeps a detached parent while its side chat is still resolving the source', async () => {
   const h = setup();
   const first = await h.attach();
