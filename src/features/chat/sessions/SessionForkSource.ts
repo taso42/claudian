@@ -18,6 +18,7 @@ import { t } from '@/i18n/i18n';
 export interface ForkSourceOwner extends SessionIdentity {
   readonly state: Pick<ChatState, 'isStreaming' | 'isRewinding' | 'messages'>;
   readonly executionCoordinator: ChatSessionRuntime['executionCoordinator'];
+  readonly responseHistoryBoundary?: string | null;
 }
 
 interface ForkSource {
@@ -67,6 +68,17 @@ async function resolveForkSource(
   const fallback = async (): Promise<string | null> => ProviderRegistry
     .getConversationHistoryService(conversation?.providerId ?? tab.providerId!)
     .resolveSessionIdForConversation(conversation);
+  const providerId = getSessionProviderId(tab, plugin, conversation);
+  if (!providerId) return null;
+  const metadata = {
+    providerId,
+    sourceProviderState: conversation?.providerState ? deepClone(conversation.providerState) : undefined,
+    sourceSelectedModel: conversation
+      ? resolveConversationModel(plugin.settings, providerId, conversation).model
+      : getSessionSelectedModel(tab, plugin) ?? undefined,
+    sourceTitle: conversation?.title,
+    linkedContentPath: conversation?.linkedContentPath,
+  };
   const coordinatedSource = await tab.executionCoordinator.resolveForkSource(
     assistantCheckpointId,
     fallback,
@@ -77,19 +89,7 @@ async function resolveForkSource(
     return null;
   }
 
-  const providerId = getSessionProviderId(tab, plugin, conversation);
-  if (!providerId) return null;
-
-  return {
-    providerId,
-    sourceSessionId,
-    sourceProviderState: conversation?.providerState,
-    sourceSelectedModel: conversation
-      ? resolveConversationModel(plugin.settings, providerId, conversation).model
-      : getSessionSelectedModel(tab, plugin) ?? undefined,
-    sourceTitle: conversation?.title,
-    linkedContentPath: conversation?.linkedContentPath,
-  };
+  return { ...metadata, sourceSessionId };
 }
 
 /**
@@ -108,12 +108,21 @@ export async function captureLatestCompletedForkSource<T extends ForkSourceOwner
   if (!getSessionCapabilities(tab, plugin).supportsFork) {
     return { ok: false, reason: 'unsupported-provider' };
   }
-  if (state.isStreaming) return { ok: false, reason: 'streaming' };
+  const forkMode = getSessionCapabilities(tab, plugin).forkMode;
+  if (state.isStreaming && (forkMode === 'full-session' || tab.responseHistoryBoundary === undefined)) {
+    return { ok: false, reason: 'streaming' };
+  }
   if (state.isRewinding) return { ok: false, reason: 'rewinding' };
 
-  const msgs = state.messages;
+  let msgs = state.messages;
+  if (state.isStreaming) {
+    // Native assistant ids can arrive before completion. Exclude the entire active
+    // turn, including steered input and continuation segments, using its owner's boundary.
+    const boundary = msgs.findIndex(message => message.id === tab.responseHistoryBoundary);
+    if (boundary < 0) return { ok: false, reason: 'no-checkpoint' };
+    msgs = msgs.slice(0, boundary + 1);
+  }
   if (msgs.length === 0) return { ok: false, reason: 'no-messages' };
-  const forkMode = getSessionCapabilities(tab, plugin).forkMode;
   if (forkMode === 'full-session' && msgs.at(-1)?.role !== 'assistant') {
     return { ok: false, reason: 'not-latest-reply' };
   }
@@ -121,10 +130,13 @@ export async function captureLatestCompletedForkSource<T extends ForkSourceOwner
   const checkpoint = findLatestForkCheckpoint(msgs);
   if (!checkpoint) return { ok: false, reason: 'no-checkpoint' };
   const lastAssistantUuid = checkpoint.assistantMessageId;
+  // Freeze both membership and message contents before source resolution can yield.
+  const checkpointIndex = msgs.length - checkpoint.trailingMessages - 1;
+  msgs = deepCloneMessages(msgs.slice(0, checkpointIndex + 1));
 
   const source = await resolveForkSource(tab, plugin, lastAssistantUuid);
   if (!source) return { ok: false, reason: 'no-session' };
-  if (!isRuntimeLive(tab) || tab.conversationId !== sourceConversationId
+  if (!isRuntimeLive(tab) || tab.conversationId !== sourceConversationId || state.isRewinding
     || (forkMode === 'full-session' && (state.isStreaming || state.messages.at(-1)?.assistantMessageId !== lastAssistantUuid))) {
     return { ok: false, reason: 'stale-binding' };
   }
@@ -134,7 +146,7 @@ export async function captureLatestCompletedForkSource<T extends ForkSourceOwner
       forkMode,
       forkAtUserMessage: msgs.filter(isCanonicalUserMessage).length + 1,
       linkedContentPath: source.linkedContentPath,
-      messages: deepCloneMessages(msgs),
+      messages: msgs,
       providerId: source.providerId,
       resumeAt: lastAssistantUuid,
       sourceConversationId,
